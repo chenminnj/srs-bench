@@ -22,7 +22,10 @@ package srs
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"github.com/pion/rtp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -276,6 +279,10 @@ func writeTrackToDisk(ctx context.Context, w media.Writer, track *webrtc.TrackRe
 			return errors.Wrapf(err, "Read RTP")
 		}
 
+		if e:= parseSei(ctx,pkt); e!=nil {
+			logger.Wf(ctx, "parseSei %vB err %+v", len(pkt.Payload), e)
+		}
+
 		if w == nil {
 			continue
 		}
@@ -289,4 +296,73 @@ func writeTrackToDisk(ctx context.Context, w media.Writer, track *webrtc.TrackRe
 	}
 
 	return ctx.Err()
+}
+
+const (
+	seiNALUType = 6
+	stapaNALUType = 24
+	fuaNALUType   = 28
+
+	fuaHeaderSize       = 2
+	stapaHeaderSize     = 1
+	stapaNALULengthSize = 2
+
+	fuaStartBitmask   = 0x80
+
+	naluHeader = 2
+)
+
+func parseSei(ctx context.Context, pkt *rtp.Packet) error{
+	if len(pkt.Payload) == 0 {
+		return errors.New("pkt.PayLoad length is zero!")
+	}
+
+	// sei: nal_unit_type = 6 ;STAP-A :nal_unit_type = 24 ;分片单元 nal_unit_type = 28
+	naluType := pkt.Payload[0] & 0x1F
+	switch {
+	case naluType == seiNALUType:
+		timeStamp := strings.Split(string(pkt.Payload[1 +naluHeader +16:len(pkt.Payload) -2]),":")
+		if len(timeStamp)!=2 || timeStamp[0]!="ts"{
+			return nil
+		}
+		//logger.Wf(ctx,"1 sei info is %s",timeStamp[1])
+		timeStamp64 ,_:= strconv.ParseInt(timeStamp[1], 10, 64)
+		logger.Wf(ctx,"I frame delay %d ms",time.Now().UnixNano()/1000000 - timeStamp64)
+
+	case naluType == stapaNALUType:
+		currOffset := int(stapaHeaderSize)
+
+		for currOffset < len(pkt.Payload) {
+			naluSize := int(binary.BigEndian.Uint16(pkt.Payload[currOffset:]))
+			currOffset += stapaNALULengthSize
+
+			if len(pkt.Payload) < currOffset+naluSize {
+				return fmt.Errorf("packet is not large enough STAP-A declared size(%d) is larger than buffer(%d)",  naluSize, len(pkt.Payload)-currOffset)
+			}
+
+			subNALUType := pkt.Payload[currOffset] & 0x1F
+			//logger.Wf(ctx,"subNALUType is %d ,naluSize is %d, pkt length is %d",subNALUType,naluSize,len(pkt.Payload) )
+			if subNALUType == seiNALUType {
+				logger.Wf(ctx,"2 sei info is %s",string(pkt.Payload[currOffset:currOffset+naluSize]))
+			}
+
+			currOffset += naluSize
+		}
+
+	case naluType == fuaNALUType:
+		if len(pkt.Payload) < fuaHeaderSize {
+			return errors.New("packet is not large enough!")
+		}
+		if pkt.Payload[1]&fuaStartBitmask != 0 {
+			fragmentedNaluType := pkt.Payload[1] & 0x1F
+
+			//logger.Wf(ctx,"fragmentedNaluType is %d ,naluSize is %d, pkt length is %d",fragmentedNaluType,len(pkt.Payload)-1,len(pkt.Payload) )
+			if fragmentedNaluType == seiNALUType{
+				logger.Wf(ctx,"fuaNALUType sei info is %s,nalu size is %d",string(pkt.Payload[fuaHeaderSize:]),len(pkt.Payload)-fuaHeaderSize)
+			}
+		}
+	default:
+		//logger.Wf(ctx,"default ,naluSize is %d,naluType is %d",len(pkt.Payload),naluType )
+	}
+	return nil
 }
