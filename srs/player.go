@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// Copyright (c) 2021 Winlin
+// # Copyright (c) 2021 Winlin
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy of
 // this software and associated documentation files (the "Software"), to deal in
@@ -24,7 +24,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/pion/logging"
 	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v3/pkg/media/h265writer"
 	"strconv"
 	"strings"
 	"sync"
@@ -42,6 +44,49 @@ import (
 	"github.com/pion/webrtc/v3/pkg/media/oggwriter"
 )
 
+type customLogger struct{}
+
+// Print all messages except trace
+func (c customLogger) Trace(msg string) { fmt.Printf("customLogger Trace: %s\n", msg) }
+func (c customLogger) Tracef(format string, args ...interface{}) {
+	c.Trace(fmt.Sprintf(format, args...))
+}
+func (c customLogger) Debug(msg string) { fmt.Printf("customLogger Debug: %s\n", msg) }
+func (c customLogger) Debugf(format string, args ...interface{}) {
+	c.Debug(fmt.Sprintf(format, args...))
+}
+func (c customLogger) Info(msg string) { fmt.Printf("customLogger Info: %s\n", msg) }
+func (c customLogger) Infof(format string, args ...interface{}) {
+	c.Info(fmt.Sprintf(format, args...))
+}
+func (c customLogger) Warn(msg string) { fmt.Printf("customLogger Warn: %s\n", msg) }
+func (c customLogger) Warnf(format string, args ...interface{}) {
+	c.Warn(fmt.Sprintf(format, args...))
+}
+func (c customLogger) Error(msg string) {
+	fmt.Printf("customLogger Error: %s\n", msg)
+}
+func (c customLogger) Errorf(format string, args ...interface{}) {
+	c.Error(fmt.Sprintf(format, args...))
+}
+
+// customLoggerFactory satisfies the interface logging.LoggerFactory
+// This allows us to create different loggers per subsystem. So we can
+// add custom behavior
+type customLoggerFactory struct{}
+
+func (c customLoggerFactory) NewLogger(subsystem string) logging.LeveledLogger {
+	fmt.Printf("Creating logger for %s \n", subsystem)
+	return customLogger{}
+}
+
+func myInterfaceFilter(ifName string) bool {
+	if ifName == "ens33" {
+		return true
+	}
+	return false
+}
+
 // @see https://github.com/pion/webrtc/blob/master/examples/save-to-disk/main.go
 func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioLevel, enableTWCC bool, pli int) error {
 	ctx = logger.WithContext(ctx)
@@ -53,6 +98,15 @@ func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioL
 	webrtcNewPeerConnection := func(configuration webrtc.Configuration) (*webrtc.PeerConnection, error) {
 		m := &webrtc.MediaEngine{}
 		if err := m.RegisterDefaultCodecs(); err != nil {
+			return nil, err
+		}
+
+		videoRTCPFeedback := []webrtc.RTCPFeedback{{"goog-remb", ""}, {"transport-cc", ""}, {"ccm", "fir"}, {"nack", ""}, {"nack", "pli"}}
+		codec := webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: "video/H265", ClockRate: 90000, RTCPFeedback: videoRTCPFeedback},
+			PayloadType:        104,
+		}
+		if err := m.RegisterCodec(codec, webrtc.RTPCodecTypeVideo); err != nil {
 			return nil, err
 		}
 
@@ -81,10 +135,14 @@ func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioL
 			return nil, err
 		}
 
-		api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
+		s := webrtc.SettingEngine{
+			LoggerFactory: customLoggerFactory{},
+		}
+		s.SetInterfaceFilter(myInterfaceFilter)
+
+		api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i), webrtc.WithSettingEngine(s))
 		return api.NewPeerConnection(configuration)
 	}
-
 	pc, err := webrtcNewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		return errors.Wrapf(err, "Create PC")
@@ -128,6 +186,7 @@ func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioL
 	var da media.Writer
 	var dv_vp8 media.Writer
 	var dv_h264 media.Writer
+	var dv_h265 media.Writer
 	defer func() {
 		if da != nil {
 			da.Close()
@@ -137,6 +196,9 @@ func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioL
 		}
 		if dv_h264 != nil {
 			dv_h264.Close()
+		}
+		if dv_h265 != nil {
+			dv_h265.Close()
 		}
 	}()
 
@@ -178,6 +240,7 @@ func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioL
 			codec.MimeType, codec.PayloadType, codec.ClockRate, trackDesc)
 
 		if codec.MimeType == "audio/opus" {
+			logger.Wf(ctx, "audio %v pt=%v", codec.MimeType, codec.PayloadType)
 			if da == nil && dumpAudio != "" {
 				if da, err = oggwriter.New(dumpAudio, codec.ClockRate, codec.Channels); err != nil {
 					return errors.Wrapf(err, "New audio dumper")
@@ -217,6 +280,21 @@ func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioL
 			}
 
 			if err = writeTrackToDisk(ctx, dv_h264, track); err != nil {
+				return errors.Wrapf(err, "Write video disk")
+			}
+		} else if codec.MimeType == "video/H265" {
+			if dumpVideo != "" && !strings.HasSuffix(dumpVideo, ".h265") {
+				return errors.Errorf("%v should be .h265 for H265", dumpVideo)
+			}
+
+			if dv_h265 == nil && dumpVideo != "" {
+				if dv_h265, err = h265writer.New(dumpVideo); err != nil {
+					return errors.Wrapf(err, "New video dumper")
+				}
+				logger.Tf(ctx, "Open h265 writer file=%v", dumpVideo)
+			}
+
+			if err = writeTrackToDisk(ctx, dv_h265, track); err != nil {
 				return errors.Wrapf(err, "Write video disk")
 			}
 		} else {
@@ -269,24 +347,44 @@ func startPlay(ctx context.Context, r, dumpAudio, dumpVideo string, enableAudioL
 	return err
 }
 
+var rtpHeadTimestampPre uint32
+var timeUnixPre int64
+
 func writeTrackToDisk(ctx context.Context, w media.Writer, track *webrtc.TrackRemote) error {
 	for ctx.Err() == nil {
 		pkt, _, err := track.ReadRTP()
+
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return errors.Wrapf(err, "Read RTP")
 		}
+		var naluType byte
+		if track.Kind() == webrtc.RTPCodecTypeVideo {
+			if track.Codec().MimeType == "video/H265" {
+				naluType = pkt.Payload[0] & 0x7E
+			} else {
+				naluType = pkt.Payload[0] & 0x1F
+			}
 
-		if e:= parseSei(ctx,pkt); e!=nil {
-			logger.Wf(ctx, "parseSei %vB err %+v", len(pkt.Payload), e)
+			if naluType != 0 && naluType != 2 {
+				//logger.Wf(ctx, "naluType %v", naluType)
+				//logger.Wf(ctx, "pkt length:%v Payload:%v", len(pkt.Payload), pkt.Payload[:10])
+			}
+
+			if e := parseSei(ctx, pkt); e != nil {
+				logger.Wf(ctx, "parseSei %vB err %+v", len(pkt.Payload), e)
+			}
+		} else {
+			timeUnix := time.Now().UnixMicro()
+			//logger.Wf(ctx, "audio pkt timestamp diff %v, receive diff: %v", pkt.Header.Timestamp-rtpHeadTimestampPre, (timeUnix-timeUnixPre)/1000)
+			timeUnixPre = timeUnix
+			rtpHeadTimestampPre = pkt.Header.Timestamp
 		}
-
 		if w == nil {
 			continue
 		}
-
 		if err := w.WriteRTP(pkt); err != nil {
 			if len(pkt.Payload) <= 2 {
 				continue
@@ -299,7 +397,7 @@ func writeTrackToDisk(ctx context.Context, w media.Writer, track *webrtc.TrackRe
 }
 
 const (
-	seiNALUType = 6
+	seiNALUType   = 6
 	stapaNALUType = 24
 	fuaNALUType   = 28
 
@@ -307,12 +405,12 @@ const (
 	stapaHeaderSize     = 1
 	stapaNALULengthSize = 2
 
-	fuaStartBitmask   = 0x80
+	fuaStartBitmask = 0x80
 
 	naluHeader = 2
 )
 
-func parseSei(ctx context.Context, pkt *rtp.Packet) error{
+func parseSei(ctx context.Context, pkt *rtp.Packet) error {
 	if len(pkt.Payload) == 0 {
 		return errors.New("pkt.PayLoad length is zero!")
 	}
@@ -321,13 +419,13 @@ func parseSei(ctx context.Context, pkt *rtp.Packet) error{
 	naluType := pkt.Payload[0] & 0x1F
 	switch {
 	case naluType == seiNALUType:
-		timeStamp := strings.Split(string(pkt.Payload[1 +naluHeader +16:len(pkt.Payload) -2]),":")
-		if len(timeStamp)!=2 || timeStamp[0]!="ts"{
+		timeStamp := strings.Split(string(pkt.Payload[1+naluHeader+16:len(pkt.Payload)-2]), ":")
+		if len(timeStamp) != 2 || timeStamp[0] != "ts" {
 			return nil
 		}
 		//logger.Wf(ctx,"1 sei info is %s",timeStamp[1])
-		timeStamp64 ,_:= strconv.ParseInt(timeStamp[1], 10, 64)
-		logger.Wf(ctx,"I frame delay %d ms",time.Now().UnixNano()/1000000 - timeStamp64)
+		timeStamp64, _ := strconv.ParseInt(timeStamp[1], 10, 64)
+		logger.Wf(ctx, "I frame delay %d ms", time.Now().UnixNano()/1000000-timeStamp64)
 
 	case naluType == stapaNALUType:
 		currOffset := int(stapaHeaderSize)
@@ -337,13 +435,13 @@ func parseSei(ctx context.Context, pkt *rtp.Packet) error{
 			currOffset += stapaNALULengthSize
 
 			if len(pkt.Payload) < currOffset+naluSize {
-				return fmt.Errorf("packet is not large enough STAP-A declared size(%d) is larger than buffer(%d)",  naluSize, len(pkt.Payload)-currOffset)
+				return fmt.Errorf("packet is not large enough STAP-A declared size(%d) is larger than buffer(%d)", naluSize, len(pkt.Payload)-currOffset)
 			}
 
 			subNALUType := pkt.Payload[currOffset] & 0x1F
 			//logger.Wf(ctx,"subNALUType is %d ,naluSize is %d, pkt length is %d",subNALUType,naluSize,len(pkt.Payload) )
 			if subNALUType == seiNALUType {
-				logger.Wf(ctx,"2 sei info is %s",string(pkt.Payload[currOffset:currOffset+naluSize]))
+				logger.Wf(ctx, "2 sei info is %s", string(pkt.Payload[currOffset:currOffset+naluSize]))
 			}
 
 			currOffset += naluSize
@@ -357,8 +455,8 @@ func parseSei(ctx context.Context, pkt *rtp.Packet) error{
 			fragmentedNaluType := pkt.Payload[1] & 0x1F
 
 			//logger.Wf(ctx,"fragmentedNaluType is %d ,naluSize is %d, pkt length is %d",fragmentedNaluType,len(pkt.Payload)-1,len(pkt.Payload) )
-			if fragmentedNaluType == seiNALUType{
-				logger.Wf(ctx,"fuaNALUType sei info is %s,nalu size is %d",string(pkt.Payload[fuaHeaderSize:]),len(pkt.Payload)-fuaHeaderSize)
+			if fragmentedNaluType == seiNALUType {
+				logger.Wf(ctx, "fuaNALUType sei info is %s,nalu size is %d", string(pkt.Payload[fuaHeaderSize:]), len(pkt.Payload)-fuaHeaderSize)
 			}
 		}
 	default:

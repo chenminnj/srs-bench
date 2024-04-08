@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"fmt"
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
@@ -139,6 +140,10 @@ func (n *GeneratorInterceptor) loop(rtcpWriter interceptor.RTCPWriter) {
 						SenderSSRC: senderSSRC,
 						MediaSSRC:  ssrc,
 						Nacks:      rtcp.NackPairsFromSequenceNumbers(missing),
+					}
+					fmt.Printf("missing is %v\n",missing)
+					for _, value := range nack.Nacks {
+						fmt.Printf("nack.Nacks is %v\n", value.PacketList())
 					}
 
 					if _, err := rtcpWriter.Write([]rtcp.Packet{nack}, interceptor.Attributes{}); err != nil {

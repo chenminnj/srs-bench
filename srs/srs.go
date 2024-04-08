@@ -137,7 +137,7 @@ func Parse(ctx context.Context) {
 	logger.Tf(ctx, "Run benchmark with %v", summaryDesc)
 
 	checkFlags := func() error {
-		if dumpVideo != "" && !strings.HasSuffix(dumpVideo, ".h264") && !strings.HasSuffix(dumpVideo, ".ivf") {
+		if dumpVideo != "" && !strings.HasSuffix(dumpVideo, ".h264") && !strings.HasSuffix(dumpVideo, ".h265") && !strings.HasSuffix(dumpVideo, ".ivf") {
 			return errors.Errorf("Should be .ivf or .264, actual %v", dumpVideo)
 		}
 
